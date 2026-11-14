@@ -1,0 +1,662 @@
+name: Build PassAuth
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      nukkit_version:
+        description: "Версия Nukkit-MOT (пусто = последняя с Maven Central)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Создать файлы плагина
+        run: |
+          mkdir -p src/main/java/ru/passauth src/main/resources
+
+          cat > src/main/java/ru/passauth/PassAuth.java <<'JAVA_EOF'
+          package ru.passauth;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.block.BlockBreakEvent;
+          import cn.nukkit.event.block.BlockPlaceEvent;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityDamageEvent;
+          import cn.nukkit.event.inventory.InventoryTransactionEvent;
+          import cn.nukkit.event.player.*;
+          import cn.nukkit.form.element.ElementInput;
+          import cn.nukkit.form.element.ElementLabel;
+          import cn.nukkit.form.response.FormResponseCustom;
+          import cn.nukkit.form.window.FormWindowCustom;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.potion.Effect;
+          import cn.nukkit.utils.LoginChainData;
+          import org.yaml.snakeyaml.DumperOptions;
+          import org.yaml.snakeyaml.Yaml;
+
+          import javax.crypto.SecretKeyFactory;
+          import javax.crypto.spec.PBEKeySpec;
+          import java.io.*;
+          import java.nio.charset.StandardCharsets;
+          import java.security.MessageDigest;
+          import java.security.SecureRandom;
+          import java.util.*;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          public class PassAuth extends PluginBase implements Listener {
+
+              private static final int MIN_LEN = 4;
+              private static final int MAX_LEN = 32;
+              private static final int MAX_ATTEMPTS = 5;     // неверных паролей до кика
+              private static final int MAX_SESSIONS = 5;     // сколько устройств помним на аккаунт
+              private static final int BLINDNESS_TICKS = 9999 * 20;
+
+              private static final SecureRandom RNG = new SecureRandom();
+              private File dataFile;   // plugins/PassAuth/data.yml: аккаунты + места выхода
+              private Map<String, Account> accounts = new HashMap<>();
+              private Map<String, Pos> positions = new HashMap<>();
+              private final Map<UUID, State> states = new ConcurrentHashMap<>();
+
+              // ---------- данные ----------
+
+              static class Account {
+                  String main;
+                  List<String> extra = new ArrayList<>();     // доп. пароли (/addpass)
+                  List<String> sessions = new ArrayList<>();  // "ip|os|deviceId"
+
+                  boolean check(String pass) {
+                      if (main != null && checkHash(pass, main)) return true;
+                      for (String h : extra) if (checkHash(pass, h)) return true;
+                      return false;
+                  }
+              }
+
+              static class Pos {
+                  String level;
+                  double x, y, z, yaw, pitch;
+
+                  static Pos of(Location l) {
+                      Pos p = new Pos();
+                      p.level = l.getLevel().getName();
+                      p.x = l.x; p.y = l.y; p.z = l.z;
+                      p.yaw = l.getYaw(); p.pitch = l.getPitch();
+                      return p;
+                  }
+              }
+
+              enum FormKind { REGISTER, LOGIN, CHANGE }
+
+              static class State {
+                  boolean authed;
+                  Pos restore;              // куда вернуть после входа
+                  int formId = -1;
+                  boolean formOpen;
+                  long lastSend;
+                  final long joinTime = System.currentTimeMillis();
+                  int attempts;
+                  String error;
+                  final Map<Integer, FormKind> forms = new HashMap<>();   // отправленные, но ещё не отвеченные формы
+              }
+
+              // ---------- запуск ----------
+
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  dataFile = new File(getDataFolder(), "data.yml");
+                  try {
+                      loadAll();
+                  } catch (Exception e) {
+                      // чтобы не затереть повреждённый файл пустым
+                      getLogger().error("Не удалось прочитать данные, плагин выключен", e);
+                      getServer().getPluginManager().disablePlugin(this);
+                      return;
+                  }
+                  getServer().getPluginManager().registerEvents(this, this);
+
+                  // повторная отправка формы: раз в 5 тиков = не чаще 4 раз в секунду
+                  getServer().getScheduler().scheduleRepeatingTask(this, () -> {
+                      long now = System.currentTimeMillis();
+                      for (Player p : getServer().getOnlinePlayers().values()) {
+                          State s = states.get(p.getUniqueId());
+                          if (s == null || s.authed || !p.isOnline()) continue;
+                          if (now - s.joinTime < 1000) continue;                 // даём клиенту загрузиться
+                          if (s.formOpen && now - s.lastSend < 30000) continue;  // форма ещё открыта
+                          if (now - s.lastSend < 250) continue;
+                          sendAuthForm(p, s);
+                      }
+                  }, 5);
+              }
+
+              @Override
+              public void onDisable() {
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      State s = states.get(p.getUniqueId());
+                      if (s != null) storePos(p, s);
+                  }
+              }
+
+              private static String str(Object o) {
+                  return o == null ? null : String.valueOf(o);
+              }
+
+              private static double num(Object o) {
+                  return o instanceof Number ? ((Number) o).doubleValue() : 0;
+              }
+
+              private static List<String> strList(Object o) {
+                  List<String> r = new ArrayList<>();
+                  if (o instanceof Collection) for (Object x : (Collection<?>) o) r.add(String.valueOf(x));
+                  return r;
+              }
+
+              private void loadAll() throws IOException {
+                  accounts = new HashMap<>();
+                  positions = new HashMap<>();
+                  if (!dataFile.exists()) return;
+                  try (Reader r = new InputStreamReader(new FileInputStream(dataFile), StandardCharsets.UTF_8)) {
+                      Object o = new Yaml().load(r);
+                      if (!(o instanceof Map)) return;
+                      Map<?, ?> root = (Map<?, ?>) o;
+
+                      Object a = root.get("accounts");
+                      if (a instanceof Map) {
+                          for (Map.Entry<?, ?> en : ((Map<?, ?>) a).entrySet()) {
+                              if (!(en.getValue() instanceof Map)) continue;
+                              Map<?, ?> m = (Map<?, ?>) en.getValue();
+                              if (m.get("password") == null) continue;
+                              Account acc = new Account();
+                              acc.main = str(m.get("password"));
+                              acc.extra = strList(m.get("extra-passwords"));
+                              acc.sessions = strList(m.get("sessions"));
+                              accounts.put(String.valueOf(en.getKey()), acc);
+                          }
+                      }
+
+                      Object ps = root.get("positions");
+                      if (ps instanceof Map) {
+                          for (Map.Entry<?, ?> en : ((Map<?, ?>) ps).entrySet()) {
+                              if (!(en.getValue() instanceof Map)) continue;
+                              Map<?, ?> m = (Map<?, ?>) en.getValue();
+                              Pos pos = new Pos();
+                              pos.level = str(m.get("level"));
+                              pos.x = num(m.get("x"));
+                              pos.y = num(m.get("y"));
+                              pos.z = num(m.get("z"));
+                              pos.yaw = num(m.get("yaw"));
+                              pos.pitch = num(m.get("pitch"));
+                              if (pos.level != null) positions.put(String.valueOf(en.getKey()), pos);
+                          }
+                      }
+                  }
+              }
+
+              private synchronized void saveAll() {
+                  Map<String, Object> acc = new LinkedHashMap<>();
+                  for (Map.Entry<String, Account> en : accounts.entrySet()) {
+                      Map<String, Object> m = new LinkedHashMap<>();
+                      m.put("password", en.getValue().main);
+                      m.put("extra-passwords", new ArrayList<>(en.getValue().extra));
+                      m.put("sessions", new ArrayList<>(en.getValue().sessions));
+                      acc.put(en.getKey(), m);
+                  }
+                  Map<String, Object> pos = new LinkedHashMap<>();
+                  for (Map.Entry<String, Pos> en : positions.entrySet()) {
+                      Pos p = en.getValue();
+                      Map<String, Object> m = new LinkedHashMap<>();
+                      m.put("level", p.level);
+                      m.put("x", p.x);
+                      m.put("y", p.y);
+                      m.put("z", p.z);
+                      m.put("yaw", p.yaw);
+                      m.put("pitch", p.pitch);
+                      pos.put(en.getKey(), m);
+                  }
+                  Map<String, Object> root = new LinkedHashMap<>();
+                  root.put("accounts", acc);
+                  root.put("positions", pos);
+
+                  DumperOptions opt = new DumperOptions();
+                  opt.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
+                  opt.setAllowUnicode(true);
+                  try (Writer w = new OutputStreamWriter(new FileOutputStream(dataFile), StandardCharsets.UTF_8)) {
+                      new Yaml(opt).dump(root, w);
+                  } catch (IOException e) {
+                      getLogger().error("Не удалось сохранить data.yml", e);
+                  }
+              }
+
+              // ---------- пароли (PBKDF2, без внешних библиотек) ----------
+
+              private static byte[] pbkdf2(String pass, byte[] salt) {
+                  try {
+                      SecretKeyFactory f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+                      return f.generateSecret(new PBEKeySpec(pass.toCharArray(), salt, 65536, 256)).getEncoded();
+                  } catch (Exception e) {
+                      throw new IllegalStateException(e);
+                  }
+              }
+
+              private static String hash(String pass) {
+                  byte[] salt = new byte[16];
+                  RNG.nextBytes(salt);
+                  Base64.Encoder b = Base64.getEncoder();
+                  return b.encodeToString(salt) + "$" + b.encodeToString(pbkdf2(pass, salt));
+              }
+
+              private static boolean checkHash(String pass, String stored) {
+                  String[] p = stored.split("\\$");
+                  if (p.length != 2) return false;
+                  byte[] salt = Base64.getDecoder().decode(p[0]);
+                  byte[] expected = Base64.getDecoder().decode(p[1]);
+                  return MessageDigest.isEqual(expected, pbkdf2(pass, salt));
+              }
+
+              private static String checkNew(String a, String b) {
+                  if (a.length() < MIN_LEN || a.length() > MAX_LEN)
+                      return "Пароль должен быть от " + MIN_LEN + " до " + MAX_LEN + " символов.";
+                  if (b != null && !a.equals(b)) return "Пароли не совпадают.";
+                  return null;
+              }
+
+              // ---------- вспомогательное ----------
+
+              private static String key(Player p) {
+                  return p.getName().toLowerCase();
+              }
+
+              private boolean locked(Player p) {
+                  State s = states.get(p.getUniqueId());
+                  return s != null && !s.authed;
+              }
+
+              /** ip|os|deviceId, либо null если DeviceId недоступен (тогда автовхода нет). */
+              private String sessionOf(Player p) {
+                  LoginChainData d = p.getLoginChainData();
+                  String id = d.getDeviceId();
+                  if (id == null || id.isEmpty()) return null;
+                  return p.getAddress() + "|" + d.getDeviceOS() + "|" + id;
+              }
+
+              private void remember(Account acc, Player p) {
+                  String ses = sessionOf(p);
+                  if (ses == null) return;
+                  acc.sessions.remove(ses);
+                  acc.sessions.add(ses);
+                  while (acc.sessions.size() > MAX_SESSIONS) acc.sessions.remove(0);
+              }
+
+              private void storePos(Player p, State s) {
+                  Pos pos = s.authed ? Pos.of(p.getLocation()) : s.restore;
+                  if (pos == null) return;
+                  positions.put(key(p), pos);
+                  saveAll();
+              }
+
+              private void teleportBack(Player p, Pos pos) {
+                  if (pos == null) return;
+                  Level lv = getServer().getLevelByName(pos.level);
+                  if (lv == null) return;
+                  p.teleport(new Location(pos.x, pos.y, pos.z, pos.yaw, pos.pitch, lv));
+              }
+
+              private static String in(FormResponseCustom r, int i) {
+                  String v = r.getInputResponse(i);
+                  return v == null ? "" : v.trim();
+              }
+
+              // ---------- вход / выход ----------
+
+              @EventHandler
+              public void onJoin(PlayerJoinEvent e) {
+                  Player p = e.getPlayer();
+                  String key = key(p);
+                  State s = new State();
+                  states.put(p.getUniqueId(), s);
+                  s.restore = positions.get(key);
+
+                  Account acc = accounts.get(key);
+                  String ses = sessionOf(p);
+                  if (acc != null && ses != null && acc.sessions.contains(ses)) {
+                      s.authed = true;
+                      teleportBack(p, s.restore);
+                      p.sendMessage("§aАвтоматический вход выполнен.");
+                      return;
+                  }
+
+                  if (s.restore == null) s.restore = Pos.of(p.getLocation());
+
+                  p.setImmobile(true);
+                  p.addEffect(Effect.getEffect(Effect.BLINDNESS).setDuration(BLINDNESS_TICKS).setVisible(false));
+                  Level def = getServer().getDefaultLevel();
+                  if (def != null) p.teleport(def.getSafeSpawn());
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  Player p = e.getPlayer();
+                  State s = states.remove(p.getUniqueId());
+                  if (s != null) storePos(p, s);
+              }
+
+              private void login(Player p, State s) {
+                  s.authed = true;
+                  s.error = null;
+                  s.attempts = 0;
+                  p.removeEffect(Effect.BLINDNESS);
+                  p.setImmobile(false);
+                  teleportBack(p, s.restore);
+                  p.sendMessage("§aВы успешно вошли в аккаунт.");
+              }
+
+              // ---------- формы ----------
+
+              private void sendAuthForm(Player p, State s) {
+                  Account acc = accounts.get(key(p));
+                  String err = s.error != null ? "§c" + s.error + "§r\n\n" : "";
+                  s.error = null;
+                  FormWindowCustom f;
+                  FormKind kind;
+                  if (acc == null) {
+                      kind = FormKind.REGISTER;
+                      f = new FormWindowCustom("Зарегистрируйтесь");
+                      f.addElement(new ElementLabel(err + "Приятной игры на нашем сервере"));
+                      f.addElement(new ElementInput("Пароль", "Введите пароль"));
+                      f.addElement(new ElementInput("Повторите пароль", "Повторите пароль"));
+                  } else {
+                      kind = FormKind.LOGIN;
+                      f = new FormWindowCustom("Вход");
+                      f.addElement(new ElementLabel(err + "Введите пароль, ваш аккаунт уже зарегистрирован. "
+                              + "Если это не ваш аккаунт, смените ник и войдите снова."));
+                      f.addElement(new ElementInput("Пароль", "Введите пароль"));
+                  }
+                  s.formId = p.showFormWindow(f);
+                  s.forms.put(s.formId, kind);
+                  s.formOpen = true;
+                  s.lastSend = System.currentTimeMillis();
+              }
+
+              private void sendChangeForm(Player p, State s, String error) {
+                  FormWindowCustom f = new FormWindowCustom("Смена пароля");
+                  f.addElement(new ElementLabel((error != null ? "§c" + error + "§r\n\n" : "") + "Введите новый пароль"));
+                  f.addElement(new ElementInput("Новый пароль", "Введите пароль"));
+                  f.addElement(new ElementInput("Повторите пароль", "Повторите пароль"));
+                  s.formId = p.showFormWindow(f);
+                  s.forms.put(s.formId, FormKind.CHANGE);
+                  s.formOpen = true;
+                  s.lastSend = System.currentTimeMillis();
+              }
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  Player p = e.getPlayer();
+                  State s = states.get(p.getUniqueId());
+                  if (s == null) return;
+                  FormKind kind = s.forms.remove(e.getFormID());
+                  if (kind == null) return;
+                  if (e.getFormID() == s.formId || !e.wasClosed()) s.formOpen = false;
+                  if (s.authed && kind != FormKind.CHANGE) return;
+                  // форма закрыта крестиком — задача сверху отправит её снова
+                  if (e.wasClosed() || !(e.getResponse() instanceof FormResponseCustom)) return;
+                  FormResponseCustom r = (FormResponseCustom) e.getResponse();
+                  String key = key(p);
+
+                  switch (kind) {
+                      case REGISTER: {
+                          if (accounts.containsKey(key)) return;
+                          String a = in(r, 1), b = in(r, 2);
+                          String err = checkNew(a, b);
+                          if (err != null) { s.error = err; return; }
+                          Account acc = new Account();
+                          acc.main = hash(a);
+                          remember(acc, p);
+                          accounts.put(key, acc);
+                          saveAll();
+                          login(p, s);
+                          break;
+                      }
+                      case LOGIN: {
+                          Account acc = accounts.get(key);
+                          if (acc != null && acc.check(in(r, 1))) {
+                              remember(acc, p);
+                              saveAll();
+                              login(p, s);
+                          } else if (++s.attempts >= MAX_ATTEMPTS) {
+                              p.kick("Слишком много неверных попыток.");
+                          } else {
+                              s.error = "Неверный пароль.";
+                          }
+                          break;
+                      }
+                      case CHANGE: {
+                          if (!s.authed) return;
+                          Account acc = accounts.get(key);
+                          if (acc == null) return;
+                          String a = in(r, 1), b = in(r, 2);
+                          String err = checkNew(a, b);
+                          if (err != null) { sendChangeForm(p, s, err); return; }
+                          acc.main = hash(a);
+                          saveAll();
+                          p.sendMessage("§aПароль изменён.");
+                          break;
+                      }
+                  }
+              }
+
+              // ---------- команды ----------
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+                  switch (cmd.getName().toLowerCase()) {
+                      case "pass": {
+                          if (!(sender instanceof Player)) {
+                              sender.sendMessage("Команда доступна только в игре.");
+                              return true;
+                          }
+                          Player p = (Player) sender;
+                          State s = states.get(p.getUniqueId());
+                          if (s == null || !s.authed || !accounts.containsKey(key(p))) {
+                              sender.sendMessage("§cСначала войдите в аккаунт.");
+                              return true;
+                          }
+                          sendChangeForm(p, s, null);
+                          return true;
+                      }
+                      case "setpass":
+                      case "addpass": {
+                          if (args.length < 2) {
+                              sender.sendMessage("Использование: /" + cmd.getName() + " <ник> <пароль>");
+                              return true;
+                          }
+                          Account acc = accounts.get(args[0].toLowerCase());
+                          if (acc == null) {
+                              sender.sendMessage("§cАккаунт " + args[0] + " не найден.");
+                              return true;
+                          }
+                          String err = checkNew(args[1], null);
+                          if (err != null) {
+                              sender.sendMessage("§c" + err);
+                              return true;
+                          }
+                          if (cmd.getName().equalsIgnoreCase("setpass")) {
+                              acc.main = hash(args[1]);
+                              sender.sendMessage("§aОсновной пароль игрока " + args[0] + " изменён.");
+                          } else {
+                              acc.extra.add(hash(args[1]));
+                              sender.sendMessage("§aДополнительный пароль для " + args[0] + " добавлен.");
+                          }
+                          saveAll();
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              // ---------- блокировки до входа ----------
+
+              @EventHandler
+              public void onMove(PlayerMoveEvent e) {
+                  if (!locked(e.getPlayer())) return;
+                  Location f = e.getFrom(), t = e.getTo();
+                  if (f.x != t.x || f.y != t.y || f.z != t.z) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onChat(PlayerChatEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onCommandPre(PlayerCommandPreprocessEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onBreak(BlockBreakEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onPlace(BlockPlaceEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onInteract(PlayerInteractEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onHeld(PlayerItemHeldEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onDrop(PlayerDropItemEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onConsume(PlayerItemConsumeEvent e) {
+                  if (locked(e.getPlayer())) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onInventory(InventoryTransactionEvent e) {
+                  Player p = e.getTransaction().getSource();
+                  if (p != null && locked(p)) e.setCancelled();
+              }
+
+              @EventHandler
+              public void onDamage(EntityDamageEvent e) {
+                  if (e.getEntity() instanceof Player && locked((Player) e.getEntity())) {
+                      e.setCancelled();
+                      return;
+                  }
+                  if (e instanceof EntityDamageByEntityEvent) {
+                      Object d = ((EntityDamageByEntityEvent) e).getDamager();
+                      if (d instanceof Player && locked((Player) d)) e.setCancelled();
+                  }
+              }
+          }
+          JAVA_EOF
+
+          cat > src/main/resources/plugin.yml <<'PLUGIN_EOF'
+          name: PassAuth
+          main: ru.passauth.PassAuth
+          version: 1.0.0
+          api: ["1.0.0"]
+          author: server
+          description: Авторизация по паролю без Xbox, автовход по IP + OS + DeviceId
+
+          commands:
+            pass:
+              description: Сменить свой пароль
+              usage: /pass
+            setpass:
+              description: Изменить пароль игроку
+              usage: /setpass <ник> <пароль>
+              permission: passauth.admin
+            addpass:
+              description: Добавить игроку дополнительный пароль
+              usage: /addpass <ник> <пароль>
+              permission: passauth.admin
+
+          permissions:
+            passauth.admin:
+              description: Управление паролями игроков
+              default: op
+          PLUGIN_EOF
+
+          cat > pom.xml <<'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>ru.passauth</groupId>
+              <artifactId>PassAuth</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+                  <nukkit.version>1.26.30-R1</nukkit.version>
+              </properties>
+
+              <repositories>
+                  <repository><id>repo-lanink-cn</id><url>https://repo.lanink.cn/repository/maven-public/</url></repository>
+                  <repository><id>opencollab-release</id><url>https://repo.opencollab.dev/maven-releases/</url></repository>
+                  <repository><id>opencollab-snapshot</id><url>https://repo.opencollab.dev/maven-snapshots/</url></repository>
+                  <repository><id>okaeri</id><url>https://repo.okaeri.cloud/releases</url></repository>
+                  <repository><id>porklib</id><url>https://maven.daporkchop.net/</url></repository>
+              </repositories>
+
+              <dependencies>
+                  <dependency>
+                      <groupId>com.nukkit-mot</groupId>
+                      <artifactId>nukkit-mot</artifactId>
+                      <version>${nukkit.version}</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+
+              <build>
+                  <finalName>PassAuth</finalName>
+              </build>
+          </project>
+          POM_EOF
+
+      - name: Определить версию Nukkit-MOT
+        run: |
+          V="${{ github.event.inputs.nukkit_version }}"
+          if [ -z "$V" ]; then
+            V=$(curl -fsSL https://repo1.maven.org/maven2/com/nukkit-mot/nukkit-mot/maven-metadata.xml | grep -oP '(?<=<release>)[^<]+' || true)
+          fi
+          if [ -z "$V" ]; then V="1.26.30-R1"; fi
+          echo "Версия Nukkit-MOT: $V"
+          echo "NUKKIT_VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Сборка
+        run: mvn -B package -Dnukkit.version="$NUKKIT_VERSION"
+
+      - name: Загрузить jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: PassAuth
+          path: target/PassAuth.jar
